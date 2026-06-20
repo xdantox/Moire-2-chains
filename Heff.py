@@ -1,105 +1,152 @@
 import numpy as np
+from dataclasses import dataclass
+from numba import njit, prange
 
-# Importamos las herramientas que hemos construido para el modelo Moiré
-from Heff_copy import Kz_field as Kz_field_default
-from Heff_copy import a1 as a1_default
-from Heff_copy import n1 as n1_default
-from Heff_copy import n2 as n2_default
-from Heff_copy import precompute_two_chain_couplings
-from Heff_copy import u2 as u2_default
+try:
+    import scipy.sparse as sp
+except ImportError:
+    sp = None
 
-# IMPORTANTE: Cambiamos la importación. Ya no traemos el paso a paso, 
-# sino la envoltura total que ejecuta la simulación completa en C.
-from rot_copy import execute_simulation 
+# =========================
+# Parametros del modelo general
+# =========================
+J0_intra = 46.75      
+J_perp0 = 0.4         
+Kz_meV = 0.76         
+muB_meV_T = 0.05788
 
-from E_copy import evaluate_energy_history
-from animation import animation_two_chains
-from cadena0 import build_afm_state_from_npy, build_chain_from_direct2chain_params
+J0_intra_field = J0_intra / muB_meV_T
+Jp0_field = J_perp0 / muB_meV_T
+Kz_field = 2.0 * Kz_meV / muB_meV_T
 
-# ==========================================
-# 1. PARÁMETROS GLOBALES Y DE TIEMPO
-# ==========================================
-dt = 1e-15          # Paso de tiempo (ajustar según estabilidad)
-total_time = (2**16) * dt  # Tiempo total
-num_pasos = int(total_time / dt)
-n_nucleos = 32      # Número de núcleos para paralelización (ajustar según tu CPU)
-# Parámetros físicos por defecto tomados de Heff_copy.py
-n1 = n1_default
-n2 = n2_default
-Kz_field = Kz_field_default
-a1 = a1_default
-u2 = u2_default
+n1 = 1198
+n2 = 1198
+a1 = 1 + 0.05
+a2 = 1.0
+x_offset = 0.0
+u2 = a2 / a1 - 1.0
+h_sep = 0.0
 
+lambda_intra = 0.3
+lambda_perp = 0.3
+tol_rel = 0.01
 
-def main():
-    # ==========================================
-    # 2. PRECOMPUTACIÓN GEOMÉTRICA (MOIRÉ)
-    # ==========================================
-    print("Calculando caché topológico del sistema Moiré...")
-    # Generamos la red estática una sola vez
-    cache = precompute_two_chain_couplings(
-        n1=n1,
-        n2=n2,
-        a1=a1,
-        u2=u2,
-        use_sparse=True,
-    )
+@dataclass(frozen=True)
+class TwoChainCouplingCache:
+    """Contenedor de acoples geometricos consolidados para JIT Total."""
+    J_intra_1: object
+    J_intra_2: object
+    W_12: object   # Matriz consolidada Cadena 1 -> Cadena 2
+    W_21: object   # Matriz consolidada Cadena 2 -> Cadena 1
+    x1: np.ndarray
+    x2: np.ndarray
+    use_sparse: bool
 
-    # ==========================================
-    # 3. CONDICIONES INICIALES
-    # ==========================================
-    # Estado AFM inicial: cadena 2 invertida respecto a cadena 1.
-    q1 = 0
-    q2 = 0
-    params = np.array(
-        [-0.0, -0.0, -1.570796, -1.570796, 0, 0, 0, 0, 0, 0],
-        dtype=float,
-    )
+# =========================
+# Geometria y Distancias
+# =========================
+def J_kernel_exp(r, J0_field, lamb):
+    return J0_field * np.exp(-r / lamb)
+
+def pairwise_distance_1d(x_left, x_right, L=None):
+    dx = np.abs(x_left[:, None] - x_right[None, :])
+    if L is not None:
+        dx = np.minimum(dx, L - dx)
+    return dx
+
+def _to_csr_if_available(M, use_sparse=True):
+    if use_sparse and sp is not None:
+        return sp.csr_matrix(M)
+    return M
+
+# =========================
+# Acoples generales
+# =========================
+def build_J_intra_general(x, J0_field=J0_intra_field, lamb=lambda_intra, tol=tol_rel, pbc=True):
+    L = None
+    if pbc and x.size > 1:
+        spacing = np.min(np.diff(np.sort(x)))
+        L = x.max() - x.min() + spacing
+
+    r = pairwise_distance_1d(x, x, L=L)
+    J = J_kernel_exp(r, J0_field, lamb)
+    np.fill_diagonal(J, 0.0)
+    J[J < tol * J0_field] = 0.0
+    J = np.maximum(J, J.T)
+    return J
+
+def precompute_two_chain_couplings(n1, n2, a1=a1, u2=u2, x_offset=x_offset, 
+                                   J0_intra_field=J0_intra_field, Jp0_field=Jp0_field, 
+                                   lambda_intra=lambda_intra, lambda_perp=lambda_perp,
+                                   tol=tol_rel, h_sep=h_sep, use_sparse=True):
+    # 1. Cadenas 1D continuas. a_eff es la verdadera distancia interatómica (a1/2)
+    a_eff = a1 / 2.0
+    x1 = np.arange(n1) * a_eff
+    x2 = (np.arange(n2) * a_eff * (1.0 + u2)) + x_offset
+
+    spacing_1 = a_eff
+    L_supercell = x1.max() - x1.min() + spacing_1
+
+    # 2. Intracadena
+    J_intra_1_dense = build_J_intra_general(x1, J0_field=J0_intra_field, lamb=lambda_intra, tol=tol, pbc=True)
+    J_intra_2_dense = build_J_intra_general(x2, J0_field=J0_intra_field, lamb=lambda_intra, tol=tol, pbc=True)
+
+    # 3. Moiré Intercadena Agnóstico (W_12 unificada en un solo paso)
+    dx_12 = pairwise_distance_1d(x1, x2, L=L_supercell)
+    r_12 = np.sqrt(dx_12**2 + h_sep**2) if h_sep != 0.0 else dx_12
     
-    S1_0 = build_afm_state_from_npy(n1,"spin_history_cadena1 relax MC = 4 Jperp=0.4.npy", noise_x=1e-5)
-    S2_0 = build_afm_state_from_npy(n2,"spin_history_cadena2 relax MC = 4 Jperp=0.4.npy", noise_x=1e-5)
+    W_12_dense = J_kernel_exp(r_12, Jp0_field, lambda_perp)
+    W_12_dense[W_12_dense < tol * Jp0_field] = 0.0
+    W_21_dense = W_12_dense.T
 
-    # NOTA: Hemos eliminado la pre-asignación manual de History_S1 y History_S2.
-    # Numba creará estas matrices internamente de una sola pasada.
-
-    # ==========================================
-    # 4. BUCLE DE INTEGRACIÓN LLG (JIT TOTAL)
-    # ==========================================
-    print(f"Iniciando integración LLG ({num_pasos} pasos) a máxima velocidad en C...")
-    
-    # Pasamos el input de n_nucleos a la función
-    History_S1, History_S2 = execute_simulation(
-        S1_0,
-        S2_0,
-        num_pasos,
-        dt,
-        cache,
-        Kz_field,
-        n_iter=14,
-        num_cores=n_nucleos  # <--- SE APLICA AQUÍ
+    return TwoChainCouplingCache(
+        J_intra_1=_to_csr_if_available(J_intra_1_dense, use_sparse=use_sparse),
+        J_intra_2=_to_csr_if_available(J_intra_2_dense, use_sparse=use_sparse),
+        W_12=_to_csr_if_available(W_12_dense, use_sparse=use_sparse),
+        W_21=_to_csr_if_available(W_21_dense, use_sparse=use_sparse),
+        x1=x1, x2=x2, use_sparse=(use_sparse and sp is not None)
     )
 
-    # ==========================================
-    # 5. ANÁLISIS Y GUARDADO
-    # ==========================================
-    print("Integración terminada. Evaluando energía...")
-    # Usamos nuestra función vectorizada para evaluar la energía en toda la historia
-    Energy_hist = evaluate_energy_history(History_S1, History_S2, cache, Kz_field)
+# =========================
+# RUTINAS NUMBA JIT PARA EL CAMPO
+# =========================
+@njit(parallel=True, fastmath=True)
+def calculate_Heff_jit(S1, S2, J1_d, J1_i, J1_p, J2_d, J2_i, J2_p,
+                       W12_d, W12_i, W12_p, W21_d, W21_i, W21_p, Kz, H1_out, H2_out):
+    """Calcula el campo efectivo total (Intra + Inter + Anisotropía) directamente en H_out."""
+    
+    # Evaluar Campo para Cadena 1
+    for i in prange(S1.shape[0]):
+        vx = 0.0; vy = 0.0; vz = 0.0
+        for k in range(J1_p[i], J1_p[i+1]):
+            col = J1_i[k]
+            vx += J1_d[k] * S1[col, 0]
+            vy += J1_d[k] * S1[col, 1]
+            vz += J1_d[k] * S1[col, 2]
+        for k in range(W12_p[i], W12_p[i+1]):
+            col = W12_i[k]
+            vx += W12_d[k] * S2[col, 0]
+            vy += W12_d[k] * S2[col, 1]
+            vz += W12_d[k] * S2[col, 2]
+        
+        H1_out[i, 0] = -vx
+        H1_out[i, 1] = -vy
+        H1_out[i, 2] = -vz + Kz * S1[i, 2]
 
-    total_spins = n1 + n2
-    print(f"Energía inicial (por espín): {Energy_hist[0] / total_spins:.6f} unidades de campo")
-    print(f"Energía final   (por espín): {Energy_hist[-1] / total_spins:.6f} unidades de campo")
+    # Evaluar Campo para Cadena 2
+    for i in prange(S2.shape[0]):
+        vx = 0.0; vy = 0.0; vz = 0.0
+        for k in range(J2_p[i], J2_p[i+1]):
+            col = J2_i[k]
+            vx += J2_d[k] * S2[col, 0]
+            vy += J2_d[k] * S2[col, 1]
+            vz += J2_d[k] * S2[col, 2]
+        for k in range(W21_p[i], W21_p[i+1]):
+            col = W21_i[k]
+            vx += W21_d[k] * S1[col, 0]
+            vy += W21_d[k] * S1[col, 1]
+            vz += W21_d[k] * S1[col, 2]
 
-    # Guardamos los binarios para evitar recalcular
-    np.save("spin_history_cadena1 fluc MC = 4 Jperp=0.4.npy", History_S1)
-    np.save("spin_history_cadena2 fluc MC = 4 Jperp=0.4.npy", History_S2)
-
-    # ==========================================
-    # 6. RENDERIZADO VISUAL
-    # ==========================================
-    print("Lanzando animación Moiré 3D...")
-    # Incluimos una separación en Y para que las flechas no colisionen visualmente
-    animation_two_chains(History_S1, History_S2, dt, cache, Kz_field, visual_y_sep=1.0)
-
-if __name__ == "__main__":
-    main()
+        H2_out[i, 0] = -vx
+        H2_out[i, 1] = -vy
+        H2_out[i, 2] = -vz + Kz * S2[i, 2]

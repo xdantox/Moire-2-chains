@@ -7,16 +7,22 @@ from Heff import n1 as n1_default
 from Heff import n2 as n2_default
 from Heff import precompute_two_chain_couplings
 from Heff import u2 as u2_default
-from rot import implicit_midpoint_step_two_chains
+
+from rot import execute_simulation 
+
 from E import evaluate_energy_history
 from animation import animation_two_chains
 from cadena0 import build_afm_state_from_npy, build_chain_from_direct2chain_params
+
 # ==========================================
 # 1. PARÁMETROS GLOBALES Y DE TIEMPO
 # ==========================================
 dt = 1e-15          # Paso de tiempo (ajustar según estabilidad)
 total_time = (2**16) * dt  # Tiempo total
 num_pasos = int(total_time / dt)
+
+# ---> CONTROL DE HARDWARE <---
+n_nucleos = 12     # Número de núcleos físicos (prueba con 8 antes de saltar a 32)
 
 # Parámetros físicos por defecto tomados de Heff.py
 n1 = n1_default
@@ -30,7 +36,7 @@ def main():
     # ==========================================
     # 2. PRECOMPUTACIÓN GEOMÉTRICA (MOIRÉ)
     # ==========================================
-    print("Calculando caché topológico del sistema Moiré...")
+    print("Calculando caché topológico (Agnóstico) del sistema Moiré...")
     # Generamos la red estática una sola vez
     cache = precompute_two_chain_couplings(
         n1=n1,
@@ -43,53 +49,33 @@ def main():
     # ==========================================
     # 3. CONDICIONES INICIALES
     # ==========================================
-    # Estado AFM inicial: cadena 2 invertida respecto a cadena 1.
+    # Estado AFM inicial extraído de relajación previa
     q1 = 0
     q2 = 0
     params = np.array(
         [-0.0, -0.0, -1.570796, -1.570796, 0, 0, 0, 0, 0, 0],
         dtype=float,
     )
-    #S1_0 = build_chain_from_direct2chain_params(n1, q1, params, chain_id=1, noise_x=1e-5, seed=1234)
-    #S2_0 = build_chain_from_direct2chain_params(n2, q2, params, chain_id=2, noise_x=1e-5, seed=4321)
+   
     S1_0 = build_afm_state_from_npy(n1,"spin_history_cadena1 relax MC = 4 Jperp=0.4.npy", noise_x=1e-5)
     S2_0 = build_afm_state_from_npy(n2,"spin_history_cadena2 relax MC = 4 Jperp=0.4.npy", noise_x=1e-5)
 
-    # Preparamos las matrices de historia (una por cadena)
-    History_S1 = np.zeros((num_pasos, n1, 3))
-    History_S2 = np.zeros((num_pasos, n2, 3))
-
-    History_S1[0] = S1_0
-    History_S2[0] = S2_0
-
     # ==========================================
-    # 4. BUCLE DE INTEGRACIÓN LLG (Punto Medio)
+    # 4. BUCLE DE INTEGRACIÓN LLG (JIT TOTAL)
     # ==========================================
-    print(f"Iniciando integración LLG ({num_pasos} pasos)...")
-    progress_step = max(1, num_pasos // 10)
-
-    for j in range(num_pasos - 1):
-        # El integrador avanza ambas cadenas simultáneamente
-        S1_new, S2_new = implicit_midpoint_step_two_chains(
-            S1_0,
-            S2_0,
-            coupling_cache=cache,
-            dt=dt,
-            Kz=Kz_field,
-            n_iter=14,
-        )
-
-        # Almacenamos el paso
-        History_S1[j + 1] = S1_new
-        History_S2[j + 1] = S2_new
-
-        # Preparamos el siguiente iterador
-        S1_0 = S1_new
-        S2_0 = S2_new
-
-        # Opcional: Barra de progreso simple
-        if (j + 1) % progress_step == 0:
-            print(f"Progreso: {100 * (j + 1) / num_pasos:.1f}%")
+    print(f"Iniciando integración LLG ({num_pasos} pasos) a máxima velocidad en C...")
+   
+    # El integrador ahora absorbe toda la simulación en una sola llamada
+    History_S1, History_S2 = execute_simulation(
+        S1_0,
+        S2_0,
+        num_pasos,
+        dt,
+        cache,
+        Kz_field,
+        n_iter=14,
+        num_cores=n_nucleos  # Inyectamos el límite de núcleos aquí
+    )
 
     # ==========================================
     # 5. ANÁLISIS Y GUARDADO

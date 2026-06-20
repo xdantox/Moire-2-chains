@@ -2,7 +2,7 @@ import numpy as np
 import math
 import numba
 from numba import njit, prange
-from Heff_copy import calculate_Heff_jit
+from Heff import calculate_Heff_jit
 
 # Parámetros globales
 gamma = 1.7e11

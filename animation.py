@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d.axes3d import Axes3D
 from typing import cast
 
-from E_copy import evaluate_energy_history
+from E import evaluate_energy_history
 
 def animation_two_chains(History_S1, History_S2, dt, cache, Kz_field, visual_y_sep=1.0):
     """
