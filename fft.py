@@ -3,217 +3,224 @@ import matplotlib.pyplot as plt
 import gc
 from scipy.interpolate import interp1d
 import matplotlib.patches as mpatches
-from Heff import a1, a2
-from chains import dt  # Asegúrate de tener definido dt o impórtalo de tu archivo de parámetros
-# Asegúrate de tener definido dt o impórtalo de tu archivo de parámetros
-# from chains import dt 
-# ===================================================================
-# 0. CONFIGURACIÓN MÍNIMA
-# ===================================================================
-# Parámetros geométricos reales de los sitios individuales
-
-# Parámetros temporales
-OMEGA_MAX = 2.5e14  # rad/s
-
-LAB_COMPONENTS = (0, 1, 2)
-APPLY_DEMEAN = True
-APPLY_HANN = True
-USE_RFFT_TIME = True
-
-# --- NUEVA OPCIÓN ---
-PLOT_INDIVIDUALS = True  # Cambia a False si solo quieres ver el compuesto RGB
-
-# Archivos
-file_fluc_1 = 'spin_history_cadena1 fluc MC = 4 Jperp=0.4.npy'
-file_fluc_2 = 'spin_history_cadena2 fluc MC = 4 Jperp=0.4.npy'
-file_rel_1  = 'spin_history_cadena1 relax MC = 4 Jperp=0.4.npy'
-file_rel_2  = 'spin_history_cadena2 relax MC = 4 Jperp=0.4.npy'
 
 # ===================================================================
 # 1. FUNCIÓN DE CÁLCULO DE POTENCIA (BASE COMPLETA)
 # ===================================================================
-def compute_power_full_chain(
-    spin_lab, gs_lab, components=(0, 1, 2),
-    demean=True, hann=True, use_rfft_time=True,
-):
+def compute_power_full_chain(spin_lab, gs_lab, components=(0, 1),
+                             demean=False, hann_temporal=True, hann_spatial=False,
+                             use_rfft_time=True, is_pbc=False, crop_margin=0,
+                             pad_factor=1, spatial_resolved=True):
+    """
+    Calcula el espectro de potencia 2D S(k, w) o la densidad de estados integrada.
+    """
     num_pasos = spin_lab.shape[0]
-    n_sites = spin_lab.shape[1]
-    
-    window_t = None
-    if hann:
-        window_t = np.hanning(num_pasos).astype(np.float32)[:, np.newaxis]
+    n_sites_total = spin_lab.shape[1]
+    n_fft = num_pasos * pad_factor
 
-    n_omega = (num_pasos // 2 + 1) if use_rfft_time else num_pasos
-    power = np.zeros((n_omega, n_sites), dtype=np.float64)
+    if not is_pbc:
+        margin = int(n_sites_total * crop_margin)
+        spatial_slice = slice(None) if margin == 0 else slice(margin, -margin)
+        n_sites_active = n_sites_total - 2 * margin
+    else:
+        spatial_slice = slice(None)
+        n_sites_active = n_sites_total
+
+    window_t = np.hanning(num_pasos).astype(np.float64)[:, np.newaxis] if hann_temporal else None
+    window_x = np.hanning(n_sites_active).astype(np.float64)[np.newaxis, :] if hann_spatial else None
+
+    n_omega = (n_fft // 2 + 1) if use_rfft_time else n_fft
+    power = np.zeros((n_omega, n_sites_active), dtype=np.float64) if spatial_resolved \
+            else np.zeros(n_omega, dtype=np.float64)
 
     for comp in components:
-        x = np.array(spin_lab[:, :, comp], dtype=np.float32, copy=True)
-        x -= gs_lab[np.newaxis, :, comp].astype(np.float32, copy=False)
-
+        x = np.array(spin_lab[:, spatial_slice, comp], dtype=np.float64, copy=True)
+        x -= gs_lab[np.newaxis, spatial_slice, comp].astype(np.float64, copy=False)
         if demean:
             x -= np.mean(x, axis=0, keepdims=True)
         if window_t is not None:
             x *= window_t
+        if window_x is not None:
+            x *= window_x
 
         if use_rfft_time:
-            fft_x = np.fft.rfft(x, axis=0)           
-            fft_x = np.fft.fft(fft_x, axis=1)        
-            fft_x = np.fft.fftshift(fft_x, axes=(1,))
+            fft_x = np.fft.rfft(x, n=n_fft, axis=0)
         else:
-            fft_x = np.fft.fftshift(np.fft.fftn(x, axes=(0, 1)), axes=(0, 1))
+            fft_x = np.fft.fftn(x, s=(n_fft, x.shape[1]), axes=(0, 1))
 
-        power += (fft_x.real * fft_x.real + fft_x.imag * fft_x.imag)
+        if spatial_resolved:
+            fft_x = np.fft.fftshift(np.fft.fft(fft_x, axis=1), axes=(1,)) if use_rfft_time else np.fft.fftshift(fft_x, axes=(0, 1))
+            power += (fft_x.real**2 + fft_x.imag**2)
+        else:
+            power += np.sum(fft_x.real**2 + fft_x.imag**2, axis=1)
         del x, fft_x
-        gc.collect()
 
-    return power
+    return power, n_fft
 
-# ===================================================================
-# 2. CARGA Y CÁLCULO PARA AMBAS CADENAS
-# ===================================================================
-def load_and_compute(file_fluc, file_rel):
-    print(f"-> Procesando {file_fluc}...")
-    hist = np.load(file_fluc, mmap_mode='r')
-    
-    rel_data = np.load(file_rel, mmap_mode='r')
-    gs = rel_data[-1] if rel_data.ndim == 3 else rel_data
-
-    power = compute_power_full_chain(
-        hist, gs, components=LAB_COMPONENTS,
-        demean=APPLY_DEMEAN, hann=APPLY_HANN, use_rfft_time=USE_RFFT_TIME
-    )
-    
-    num_pasos = hist.shape[0]
-    n_spins = hist.shape[1]
-    
-    del hist, gs, rel_data
-    gc.collect()
-    return power, num_pasos, n_spins
-
-power_1, num_pasos, n_spins_1 = load_and_compute(file_fluc_1, file_rel_1)
-power_2, _, n_spins_2         = load_and_compute(file_fluc_2, file_rel_2)
-
-# Convertir a escala logarítmica
-log_mag_1 = np.log10(power_1 + 1e-12)
-log_mag_2 = np.log10(power_2 + 1e-12)
 
 # ===================================================================
-# 3. CONSTRUCCIÓN DE EJES FÍSICOS E INTERPOLACIÓN (RGB)
+# 2. FUNCIÓN DE GRAFICACIÓN EN LA ZONA DE BRILLOUIN MOIRÉ
 # ===================================================================
-if USE_RFFT_TIME:
-    omega_values = np.fft.rfftfreq(num_pasos, d=dt) * 2 * np.pi
-else:
-    omega_values = np.fft.fftshift(np.fft.fftfreq(num_pasos, d=dt) * 2 * np.pi)
+def plot_moire_spectrum(power_1, power_2, n_sites_1, n_sites_2, num_pasos, dt, a1, a2, 
+                        gamma=1.7e11, J0_field=1.0, E_MAX=1.8, 
+                        USE_RFFT_TIME=True, PLOT_INDIVIDUALS=False):
+    print("-> Generando visualización espectral sincronizada con diag.py...")
 
-mask_w = (omega_values <= OMEGA_MAX) if USE_RFFT_TIME else (np.abs(omega_values) <= OMEGA_MAX)
-omega_plot = omega_values[mask_w]
+    n_sites_1 = power_1.shape[1]
+    n_sites_2 = power_2.shape[1]
+    omega_J = gamma * J0_field
 
-log_mag_1 = log_mag_1[mask_w, :]
-log_mag_2 = log_mag_2[mask_w, :]
+    log_mag_1 = np.log10(power_1 + 1e-12)
+    log_mag_2 = np.log10(power_2 + 1e-12)
 
-k_vals_1 = np.fft.fftshift(np.fft.fftfreq(n_spins_1, d=a1)) * 2 * np.pi
-k_vals_2 = np.fft.fftshift(np.fft.fftfreq(n_spins_2, d=a2)) * 2 * np.pi
+    # 1. Eje de frecuencias y conversión a energía adimensional hbar*w / J0
+    if USE_RFFT_TIME:
+        omega_values = np.fft.rfftfreq(num_pasos, d=dt) * 2.0 * np.pi
+    else:
+        omega_values = np.fft.fftshift(np.fft.fftfreq(num_pasos, d=dt) * 2.0 * np.pi)
 
-k_max_abs = max(np.pi/a1, np.pi/a2) * 1.05
-k_common = np.linspace(-k_max_abs, k_max_abs, 800)
+    energy_values = omega_values / omega_J
+    mask_e = (energy_values <= E_MAX) if USE_RFFT_TIME else (np.abs(energy_values) <= E_MAX)
+    energy_plot = energy_values[mask_e]
 
-S1_interp = np.zeros((len(omega_plot), len(k_common)))
-S2_interp = np.zeros((len(omega_plot), len(k_common)))
+    log_mag_1 = log_mag_1[mask_e, :]
+    log_mag_2 = log_mag_2[mask_e, :]
 
-print("Interpolando espectros a malla K común para composición RGB...")
-for i in range(len(omega_plot)):
-    f1 = interp1d(k_vals_1, log_mag_1[i, :], kind='linear', bounds_error=False, fill_value=0.0)
-    S1_interp[i, :] = f1(k_common)
-    
-    f2 = interp1d(k_vals_2, log_mag_2[i, :], kind='linear', bounds_error=False, fill_value=0.0)
-    S2_interp[i, :] = f2(k_common)
+    # 2. Ejes K físicos (paso atómico real d = a / 2)
+    k_vals_1 = np.fft.fftshift(np.fft.fftfreq(n_sites_1, d=a1 / 2.0)) * 2.0 * np.pi
+    k_vals_2 = np.fft.fftshift(np.fft.fftfreq(n_sites_2, d=a2 / 2.0)) * 2.0 * np.pi
 
-# ===================================================================
-# 4. NORMALIZACIÓN Y COMPOSICIÓN DEL COLORMAP
-# ===================================================================
-def normalize_array(arr, p_low=4, p_high=99.4):
-    valid = arr[arr > np.min(arr)]
-    if len(valid) == 0: return np.zeros_like(arr)
-    vmin = np.percentile(valid, p_low)
-    vmax = np.percentile(valid, p_high)
-    norm = (arr - vmin) / (vmax - vmin)
-    return np.clip(norm, 0, 1)
+    # Cuasimomento en la primera zona de Brillouin moiré.
+    moire_reciprocal = 2.0 * np.pi * abs(1.0 / a1 - 1.0 / a2)
+    k_max_abs = moire_reciprocal / 2.0
+    k_common = np.linspace(-k_max_abs, k_max_abs, 1000)
 
-norm_1 = normalize_array(S1_interp)
-norm_2 = normalize_array(S2_interp)
+    # 3. Pliegue periódico de los momentos físicos a la mBZ e interpolación.
+    min_val_1 = np.min(log_mag_1)
+    min_val_2 = np.min(log_mag_2)
 
-rgb_image = np.zeros((len(omega_plot), len(k_common), 3), dtype=np.float32)
-rgb_image[:, :, 0] = norm_1  # ROJO: Cadena 1
-rgb_image[:, :, 2] = norm_2  # AZUL: Cadena 2
-rgb_image = np.maximum(rgb_image, 0.05)  
+    f1 = interp1d(k_vals_1, log_mag_1, axis=1, kind='linear', bounds_error=False, fill_value=min_val_1)
+    f2 = interp1d(k_vals_2, log_mag_2, axis=1, kind='linear', bounds_error=False, fill_value=min_val_2)
 
-# ===================================================================
-# 5. RENDERIZADO VISUAL
-# ===================================================================
-print("Generando gráficos...")
+    def fold_to_moire_bz(interpolator, k_values, fill_value):
+        n_shifts = int(np.ceil(np.max(np.abs(k_values)) / moire_reciprocal)) + 2
+        shifts = np.arange(-n_shifts, n_shifts + 1) * moire_reciprocal
+        folded_intensities = [
+            interpolator(k_common + shift) for shift in shifts
+        ]
+        return np.maximum.reduce(folded_intensities)
 
-# ---------------------------------------------------------
-# OPCIONAL: GRÁFICOS INDIVIDUALES
-# ---------------------------------------------------------
-if PLOT_INDIVIDUALS:
-    # --- Gráfico Cadena 1 ---
-    plt.figure(figsize=(10, 6))
-    K1, W1 = np.meshgrid(k_vals_1, omega_plot)
-    vmin1 = float(np.percentile(log_mag_1, 4))
-    vmax1 = float(np.percentile(log_mag_1, 99.4))
-    mesh1 = plt.pcolormesh(K1, W1, log_mag_1, cmap='plasma', vmin=vmin1, vmax=vmax1, shading='nearest')
-    plt.colorbar(mesh1, label=r'$\log_{10} S_1(k, \omega)$')
-    plt.axvline(-np.pi/a1, color='white', linestyle='--', alpha=0.6, label=r'BZ ($-\pi/a_1$)')
-    plt.axvline( np.pi/a1, color='white', linestyle='--', alpha=0.6)
-    plt.xlabel(r'$k$ $[rad/m]$')
-    plt.ylabel(r'$\omega$ $[rad/s]$')
-    plt.title(f'Espectro Aislado: Cadena 1 ($a_1 = {a1}$)')
+    S1_interp = fold_to_moire_bz(f1, k_vals_1, min_val_1)
+    S2_interp = fold_to_moire_bz(f2, k_vals_2, min_val_2)
+
+    # 4. Normalización común: log-intensidad, percentiles y clipping
+    def normalize_array(arr, p_low=5.0, p_high=99.8):
+        vmin = np.percentile(arr, p_low)
+        vmax = np.percentile(arr, p_high)
+        norm = (arr - vmin) / (vmax - vmin + 1e-12)
+        return np.clip(norm, 0.0, 1.0)
+
+    # 5. Combina las dos cadenas y aplica la normalización una sola vez
+    S_total = normalize_array(np.maximum(S1_interp, S2_interp))
+
+    # =================================================================
+    # 6. Renderizado en la mBZ con escala [0, 1].
+    # =================================================================
+    plt.figure(figsize=(6, 12), dpi=120)
+    extent = (k_common[0], k_common[-1], energy_plot[0], energy_plot[-1])
+
+    im = plt.imshow(S_total, origin='lower', aspect='auto', extent=extent,
+                    cmap='Greens', vmin=0.0, vmax=1.0, interpolation='bilinear')
+
+    # Barra de color graduada de 0 a 1 exactamente igual a diag.py
+    cbar = plt.colorbar(im, label='Normalized Spectral Intensity')
+    cbar.set_ticks(np.linspace(0.0, 1.0, 6))
+
+    plt.axvline(-k_max_abs, color='crimson', linestyle='--', alpha=0.8, lw=1.2,
+                label=r'mBZ boundary ($\pm G_{\mathrm{M}}/2$)')
+    plt.axvline(k_max_abs, color='crimson', linestyle='--', alpha=0.8, lw=1.2)
+
+    plt.ylim(0.0, E_MAX)
     plt.xlim(-k_max_abs, k_max_abs)
-    plt.ylim(0, OMEGA_MAX)
-    plt.legend(loc='upper right')
+    plt.ylabel(r'$\hbar\omega / J_0$ (Adimensional Energy)', fontsize=12)
+    plt.xlabel(r'$k$ (Physical Wavenumber) $[rad/m]$', fontsize=12)
+    plt.title('LLG spectrum', fontsize=14)
+    plt.legend(loc='lower center', framealpha=0.8)
     plt.tight_layout()
+    plt.savefig('LLG spectrum.png', dpi=300, bbox_inches='tight')
+    print("-> Figura guardada automáticamente como 'LLG_spectrum.png'.")
+    plt.show()
 
-    # --- Gráfico Cadena 2 ---
-    plt.figure(figsize=(10, 6))
-    K2, W2 = np.meshgrid(k_vals_2, omega_plot)
-    vmin2 = float(np.percentile(log_mag_2, 4))
-    vmax2 = float(np.percentile(log_mag_2, 99.4))
-    mesh2 = plt.pcolormesh(K2, W2, log_mag_2, cmap='plasma', vmin=vmin2, vmax=vmax2, shading='nearest')
-    plt.colorbar(mesh2, label=r'$\log_{10} S_2(k, \omega)$')
-    plt.axvline(-np.pi/a2, color='white', linestyle='-.', alpha=0.6, label=r'BZ ($-\pi/a_2$)')
-    plt.axvline( np.pi/a2, color='white', linestyle='-.', alpha=0.6)
-    plt.xlabel(r'$k$ $[rad/m]$')
-    plt.ylabel(r'$\omega$ $[rad/s]$')
-    plt.title(f'Espectro Aislado: Cadena 2 ($a_2 = {a2}$)')
-    plt.xlim(-k_max_abs, k_max_abs)
-    plt.ylim(0, OMEGA_MAX)
-    plt.legend(loc='upper right')
-    plt.tight_layout()
 
-# ---------------------------------------------------------
-# GRÁFICO COMPUESTO RGB
-# ---------------------------------------------------------
-plt.figure(figsize=(12, 8))
-extent = (k_common[0], k_common[-1], omega_plot[0], omega_plot[-1])
-plt.imshow(rgb_image, origin='lower', aspect='auto', extent=extent, interpolation='bilinear')
+# ===================================================================
+# 3. MODO SCRIPT (EJECUCIÓN)
+# ===================================================================
+if __name__ == "__main__":
+    from Heff import a1, a2
 
-plt.axvline(-np.pi/a1, color='red', linestyle='--', alpha=0.6, label=r'BZ 1 ($-\pi/a_1$)')
-plt.axvline( np.pi/a1, color='red', linestyle='--', alpha=0.6)
-plt.axvline(-np.pi/a2, color='dodgerblue', linestyle='-.', alpha=0.6, label=r'BZ 2 ($-\pi/a_2$)')
-plt.axvline( np.pi/a2, color='dodgerblue', linestyle='-.', alpha=0.6)
+    dt_base = 1e-12
+    SAVE_STEP = 10
+    dt_efectivo = dt_base * SAVE_STEP
 
-red_patch = mpatches.Patch(color='red', label=r'Cadena 1 ($a_1$)')
-blue_patch = mpatches.Patch(color='blue', label=r'Cadena 2 ($a_2$)')
-purple_patch = mpatches.Patch(color='purple', label='Hibridación Intercadena')
-handles, labels = plt.gca().get_legend_handles_labels()
-handles.extend([red_patch, blue_patch, purple_patch])
+    GAMMA = 1.7e11           # rad/(s*T)
+    J0_FIELD = 1.0           # Campo de canje base (T)
+    E_MAX = 1.8              # Techo de energía idéntico a diag.py (1.8)
 
-plt.legend(handles=handles, loc='upper right', framealpha=0.9, fontsize=10)
-plt.xlabel(r'$k$ (Momento físico absoluto) $[rad/m]$', fontsize=12)
-plt.ylabel(r'$\omega$ Frecuencia $[rad/s]$', fontsize=12)
-plt.title('Espectro Compuesto Moiré - Zona Extendida', fontsize=14)
-plt.ylim(0, OMEGA_MAX)
-plt.xlim(-k_max_abs, k_max_abs)
+    LAB_COMPONENTS = (0, 1)  # Fluctuaciones transversales (Sx, Sy)
+    APPLY_DEMEAN = True
+    APPLY_HANN = False
+    USE_RFFT_TIME = True
+    PLOT_INDIVIDUALS = False 
+    IS_PBC = True
 
-plt.tight_layout()
-plt.show()
+    LOAD_SPECTRUM_FROM_DISK = False
+
+    if LOAD_SPECTRUM_FROM_DISK:
+        print("-> [Modo Carga Rápida] Leyendo espectros precalculados desde el disco...")
+        power_1 = np.load('espectro_potencia_cadena1.npy')
+        power_2 = np.load('espectro_potencia_cadena2.npy')
+        n_sites_1 = power_1.shape[1]
+        n_sites_2 = power_2.shape[1]
+        num_pasos_inferido = (power_1.shape[0] - 1) * 2 if USE_RFFT_TIME else power_1.shape[0]
+
+        plot_moire_spectrum(
+            power_1, power_2, n_sites_1, n_sites_2, 
+            num_pasos_inferido, dt_efectivo, a1, a2,
+            gamma=GAMMA, J0_field=J0_FIELD, E_MAX=E_MAX,
+            USE_RFFT_TIME=USE_RFFT_TIME, PLOT_INDIVIDUALS=PLOT_INDIVIDUALS
+        )
+
+    else:
+        print("-> [Modo Cálculo Completo] Calculando FFT desde las historias de espín...")
+        file_fluc_1 = 'spin_history_cadena1 fluc Jperp=Jintra=1 PBC h = 1.7 epsilon = 0.1.npy'
+        file_fluc_2 = 'spin_history_cadena2 fluc Jperp=Jintra=1 PBC h = 1.7 epsilon = 0.1.npy'
+        file_rel_1  = 'spin_history_cadena1 relax Jperp=Jintra=1 PBC h = 1.7 epsilon = 0.1.npy'
+        file_rel_2  = 'spin_history_cadena2 relax Jperp=Jintra=1 PBC h = 1.7 epsilon = 0.1.npy'
+
+        def load_and_compute(file_fluc, file_rel, is_pbc):
+            print(f"-> Procesando {file_fluc}...")
+            hist = np.load(file_fluc, mmap_mode='r')
+            rel_data = np.load(file_rel, mmap_mode='r')
+            gs = rel_data[-1] if rel_data.ndim == 3 else rel_data
+
+            power, n_fft_time = compute_power_full_chain(
+                hist, gs, components=LAB_COMPONENTS,
+                demean=APPLY_DEMEAN, hann_temporal=APPLY_HANN, hann_spatial=APPLY_HANN, 
+                use_rfft_time=USE_RFFT_TIME, is_pbc=is_pbc
+            )
+
+            n_sites = power.shape[1]
+            num_pasos = n_fft_time
+            del hist, gs, rel_data
+            gc.collect()
+            return power, num_pasos, n_sites
+
+        power_1, num_pasos, n_sites_1 = load_and_compute(file_fluc_1, file_rel_1, IS_PBC)
+        power_2, _, n_sites_2         = load_and_compute(file_fluc_2, file_rel_2, IS_PBC)
+
+        plot_moire_spectrum(
+            power_1, power_2, n_sites_1, n_sites_2, 
+            num_pasos, dt_efectivo, a1, a2,
+            gamma=GAMMA, J0_field=J0_FIELD, E_MAX=E_MAX,
+            USE_RFFT_TIME=USE_RFFT_TIME, PLOT_INDIVIDUALS=PLOT_INDIVIDUALS
+        )

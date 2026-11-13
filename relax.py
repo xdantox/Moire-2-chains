@@ -113,7 +113,7 @@ if __name__ == "__main__":
     
     # 1. Cargar el estado relajado aislado (J_perp = 0)
     try:
-        hist_aislado = np.load('spin_history_cadena1 fluc MC = 4 Jperp=0.npy', mmap_mode='r')
+        hist_aislado = np.load('spin_history_cadena1 relax Jperp=Jintra=1 PBC h = 1.7.npy', mmap_mode='r')
         estado_aislado = hist_aislado[-1].copy()
     except FileNotFoundError:
         estado_aislado = None
@@ -121,7 +121,7 @@ if __name__ == "__main__":
 
     # 2. Cargar el estado relajado acoplado (J_perp = 0.4)
     try:
-        hist_acoplado = np.load('spin_history_cadena1 relax MC = 4 Jperp=0.4.npy', mmap_mode='r')
+        hist_acoplado = np.load('.npy', mmap_mode='r')
         estado_acoplado = hist_acoplado[-1].copy()
     except FileNotFoundError:
         estado_acoplado = None

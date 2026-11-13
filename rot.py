@@ -70,32 +70,48 @@ def apply_rodrigues_rotation_jit(c_old, w, dt, c_new):
 @njit(fastmath=True)
 def run_llg_jit_total(S1_0, S2_0, num_pasos, dt, Kz, n_iter, gamma_val, alpha_val,
                       J1_d, J1_i, J1_p, J2_d, J2_i, J2_p,
-                      W12_d, W12_i, W12_p, W21_d, W21_i, W21_p):
+                      W12_d, W12_i, W12_p, W21_d, W21_i, W21_p,
+                      save_step): # <--- AÑADIDO: Parámetro de submuestreo
     """
     Este bucle gigante se compila completamente en C.
     No asigna memoria temporal ni sufre de "Garbage Collection".
+    Aplica submuestreo para garantizar que la RAM no se sature.
     """
     N1 = S1_0.shape[0]
     N2 = S2_0.shape[0]
 
-    # Asignamos la memoria maestra UNA SOLA VEZ para toda la simulación
-    History_S1 = np.zeros((num_pasos, N1, 3))
-    History_S2 = np.zeros((num_pasos, N2, 3))
+    # Calculamos la memoria exacta necesaria para el submuestreo
+    # El +1 asegura que tengamos espacio para guardar el estado inicial t=0
+    num_saved = (num_pasos - 1) // save_step + 1
+
+    # Asignamos la memoria maestra reducida UNA SOLA VEZ
+    History_S1 = np.zeros((num_saved, N1, 3), dtype=np.float64)
+    History_S2 = np.zeros((num_saved, N2, 3), dtype=np.float64)
+    
     History_S1[0] = S1_0
     History_S2[0] = S2_0
 
     S1_old = S1_0.copy()
     S2_old = S2_0.copy()
 
-    # Arreglos de estado temporales que serán reciclados un millón de veces
+    # Arreglos de estado temporales que serán reciclados millones de veces
     S1_new = np.empty_like(S1_old); S2_new = np.empty_like(S2_old)
     S1_mid = np.empty_like(S1_old); S2_mid = np.empty_like(S2_old)
     H1 = np.empty_like(S1_old);     H2 = np.empty_like(S2_old)
     w1 = np.empty_like(S1_old);     w2 = np.empty_like(S2_old)
 
+    save_idx = 1 # Índice independiente para ir llenando la matriz History
+
     for j in range(num_pasos - 1):
         
+        # El paso de tiempo actual en la física
+        t = j + 1 
+        # ---Tiempo ---
+        if t % 50000 == 0:
+            print("Integrando paso", t, "de", num_pasos, "...")
+        # ========================================================
         # 1. Predictor (Euler o Rodrigues inicial)
+        # ========================================================
         calculate_Heff_jit(S1_old, S2_old, J1_d, J1_i, J1_p, J2_d, J2_i, J2_p,
                            W12_d, W12_i, W12_p, W21_d, W21_i, W21_p, Kz, H1, H2)
         calculate_omega_jit(H1, S1_old, gamma_val, alpha_val, w1)
@@ -104,7 +120,9 @@ def run_llg_jit_total(S1_0, S2_0, num_pasos, dt, Kz, n_iter, gamma_val, alpha_va
         apply_rodrigues_rotation_jit(S1_old, w1, dt, S1_new)
         apply_rodrigues_rotation_jit(S2_old, w2, dt, S2_new)
 
+        # ========================================================
         # 2. Corrector (Punto Medio Implícito)
+        # ========================================================
         for _ in range(n_iter):
             midpoint_normalize_jit(S1_old, S1_new, S1_mid)
             midpoint_normalize_jit(S2_old, S2_new, S2_mid)
@@ -118,19 +136,26 @@ def run_llg_jit_total(S1_0, S2_0, num_pasos, dt, Kz, n_iter, gamma_val, alpha_va
             apply_rodrigues_rotation_jit(S1_old, w1, dt, S1_new)
             apply_rodrigues_rotation_jit(S2_old, w2, dt, S2_new)
 
-        # Actualización de estados
+        # ========================================================
+        # Actualización de estados (El Universo Avanza)
+        # ========================================================
         S1_old[:] = S1_new
         S2_old[:] = S2_new
 
-        History_S1[j+1] = S1_old
-        History_S2[j+1] = S2_old
+        # ========================================================
+        # 3. La Cámara: Guardado con Submuestreo
+        # ========================================================
+        if t % save_step == 0 and save_idx < num_saved:
+            History_S1[save_idx] = S1_old
+            History_S2[save_idx] = S2_old
+            save_idx += 1
 
     return History_S1, History_S2
 
 # =========================================================
 # FUNCIÓN ENVOLTORIO PARA LLAMAR DESDE TU MAIN.PY
 # =========================================================
-def execute_simulation(S1_0, S2_0, num_pasos, dt, coupling_cache, Kz, n_iter=14, num_cores=8):
+def execute_simulation(S1_0, S2_0, num_pasos, dt, coupling_cache, Kz, n_iter=14, num_cores=8, save_step=10, alpha=alpha):
     """
     Desempaqueta las matrices de SciPy y lanza el integrador JIT.
     Permite configurar dinámicamente el número de núcleos de CPU a utilizar.
@@ -140,6 +165,7 @@ def execute_simulation(S1_0, S2_0, num_pasos, dt, coupling_cache, Kz, n_iter=14,
     # 1. Configuramos el hardware según el input del usuario
     numba.set_num_threads(num_cores)
     print(f"[Hardware] Motor JIT configurado para usar {num_cores} núcleos físicos.")
+    print(f"[Memoria] Guardando 1 de cada {save_step} pasos (Submuestreo activo).")
 
     # 2. Desempaquetamos los arreglos crudos
     J1 = coupling_cache.J_intra_1
@@ -147,12 +173,13 @@ def execute_simulation(S1_0, S2_0, num_pasos, dt, coupling_cache, Kz, n_iter=14,
     W12 = coupling_cache.W_12
     W21 = coupling_cache.W_21
 
-    # 3. Lanzamos el motor C
+    # 3. Lanzamos el motor C (Le inyectamos save_step al final)
     Hist_S1, Hist_S2 = run_llg_jit_total(
         S1_0, S2_0, num_pasos, dt, Kz, n_iter, gamma, alpha,
         J1.data, J1.indices, J1.indptr,
         J2.data, J2.indices, J2.indptr,
         W12.data, W12.indices, W12.indptr,
-        W21.data, W21.indices, W21.indptr
+        W21.data, W21.indices, W21.indptr,
+        save_step  # <--- NUEVO PARÁMETRO AÑADIDO AQUÍ
     )
     return Hist_S1, Hist_S2
